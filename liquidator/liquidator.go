@@ -44,8 +44,7 @@ type LiquidatorSystem struct {
 	PriceFeedChan      chan *mev.PriceFeed
 	PriceDeviationChan chan *mev.PriceDeviation
 	ErrorChan          chan error
-	CurrentJob         *Job
-	JobMutex           sync.Mutex
+	Oracle2Job         map[string]*Job // key is TokenName
 	SubscribeTokens    []string
 	LastBlockNumber    uint64
 	LastBaseFee        *big.Int
@@ -54,7 +53,6 @@ type LiquidatorSystem struct {
 	SpamEOAs        []common.Address
 	SpamPrivateKeys []*ecdsa.PrivateKey
 	SpamNonces      map[common.Address]uint64
-	NonceMutex      sync.Mutex
 	CurEOAIndex     int
 }
 
@@ -85,6 +83,7 @@ func NewLiquidatorSystem(client *ethclient.Client, subscribeTokens []string, mne
 		PriceFeedChan:      make(chan *mev.PriceFeed, 100),
 		PriceDeviationChan: make(chan *mev.PriceDeviation, 100),
 		ErrorChan:          make(chan error, 100),
+		Oracle2Job:         make(map[string]*Job),
 		SubscribeTokens:    subscribeTokens,
 		SpamEOAs:           eoas,
 		SpamPrivateKeys:    privateKeys,
@@ -95,9 +94,6 @@ func NewLiquidatorSystem(client *ethclient.Client, subscribeTokens []string, mne
 
 // InitializeNonces initializes nonces for all EOAs
 func (ls *LiquidatorSystem) InitializeNonces() error {
-	ls.NonceMutex.Lock()
-	defer ls.NonceMutex.Unlock()
-
 	for _, eoa := range ls.SpamEOAs {
 		nonce, err := ls.Client.PendingNonceAt(context.Background(), eoa)
 		if err != nil {
@@ -111,9 +107,6 @@ func (ls *LiquidatorSystem) InitializeNonces() error {
 
 // GetNextEOA returns the next EOA in round-robin fashion
 func (ls *LiquidatorSystem) GetNextEOA() (common.Address, *ecdsa.PrivateKey, uint64) {
-	ls.NonceMutex.Lock()
-	defer ls.NonceMutex.Unlock()
-
 	eoa := ls.SpamEOAs[ls.CurEOAIndex]
 	pk := ls.SpamPrivateKeys[ls.CurEOAIndex]
 	nonce := ls.SpamNonces[eoa]
@@ -207,15 +200,15 @@ func (ls *LiquidatorSystem) FetchBlockAndLogs() (*types.Block, []types.Log, erro
 
 // CreateJob creates a new job from price deviation
 func (ls *LiquidatorSystem) CreateJob(pd *mev.PriceDeviation, blockNumber uint64) {
-	ls.JobMutex.Lock()
-	defer ls.JobMutex.Unlock()
+	token := pd.Token
 
-	if ls.CurrentJob != nil && !ls.CurrentJob.Finished {
-		log.Printf("Job already in progress, skipping")
+	// Check if job already exists for this token
+	if existingJob, ok := ls.Oracle2Job[token]; ok && !existingJob.Finished {
+		log.Printf("Job already exists for token %s, skipping", token)
 		return
 	}
 
-	ls.CurrentJob = &Job{
+	ls.Oracle2Job[token] = &Job{
 		PriceDeviation: pd,
 		BlockNumber:    blockNumber,
 		BlocksSent:     0,
@@ -223,15 +216,20 @@ func (ls *LiquidatorSystem) CreateJob(pd *mev.PriceDeviation, blockNumber uint64
 		StartTime:      time.Now(),
 		Finished:       false,
 	}
-	log.Printf("Job created for token %s at block %d", pd.Token, blockNumber)
+	log.Printf("Job created for token %s at block %d", token, blockNumber)
 }
 
-// ProcessJob processes the current job, sending transactions each block
+// ProcessJob processes all active jobs, sending transactions once and adding to all active jobs
 func (ls *LiquidatorSystem) ProcessJob() {
-	ls.JobMutex.Lock()
-	defer ls.JobMutex.Unlock()
+	// Collect active jobs
+	activeTokens := make([]string, 0)
+	for token, job := range ls.Oracle2Job {
+		if !job.Finished {
+			activeTokens = append(activeTokens, token)
+		}
+	}
 
-	if ls.CurrentJob == nil || ls.CurrentJob.Finished {
+	if len(activeTokens) == 0 {
 		return
 	}
 
@@ -255,9 +253,10 @@ func (ls *LiquidatorSystem) ProcessJob() {
 	baseFee := ls.LastBaseFee
 	baseFeeDouble := new(big.Int).Mul(baseFee, big.NewInt(2))
 
-	// Send len(FeeDataRecords)*2 transactions (maxReward and maxPriority for each record)
+	// Send len(FeeDataRecords)*2 transactions once (maxReward and maxPriority for each record)
 	txCount := len(feeDataRecords) * 2
-	log.Printf("Sending %d transactions for block %d (feeDataRecords=%d, baseFee=%s)", txCount, ls.LastBlockNumber, len(feeDataRecords), baseFee.String())
+	log.Printf("Sending %d transactions at block %d for %d active jobs (feeDataRecords=%d, baseFee=%s)",
+		txCount, ls.LastBlockNumber, len(activeTokens), len(feeDataRecords), baseFee.String())
 
 	for i, record := range feeDataRecords {
 		if record.FeeHistory == nil || record.MaxPriorityFee == nil {
@@ -272,8 +271,8 @@ func (ls *LiquidatorSystem) ProcessJob() {
 		if maxRewardTip.Cmp(big.NewInt(0)) > 0 {
 			// feeCap = baseFee * 2 + tipCap
 			maxRewardFeeCap := new(big.Int).Add(baseFeeDouble, maxRewardTip)
-			// Send maxReward tx (nextBaseFee = nil)
-			ls.sendSpamTx(maxRewardTip, maxRewardFeeCap, "maxReward")
+			// Send maxReward tx and add to all active jobs
+			ls.sendSpamTxToActiveJobs(activeTokens, maxRewardTip, maxRewardFeeCap, "maxReward")
 		} else {
 			log.Printf("Skipping maxReward tx: tipCap is 0")
 		}
@@ -285,81 +284,95 @@ func (ls *LiquidatorSystem) ProcessJob() {
 		if maxPriorityTip.Cmp(big.NewInt(0)) > 0 {
 			// feeCap = baseFee * 2 + tipCap
 			maxPriorityFeeCap := new(big.Int).Add(baseFeeDouble, maxPriorityTip)
-			// Send maxPriority tx (nextBaseFee = nil)
-			ls.sendSpamTx(maxPriorityTip, maxPriorityFeeCap, "maxPriority")
+			// Send maxPriority tx and add to all active jobs
+			ls.sendSpamTxToActiveJobs(activeTokens, maxPriorityTip, maxPriorityFeeCap, "maxPriority")
 		} else {
 			log.Printf("Skipping maxPriority tx: tipCap is 0")
 		}
 	}
 
-	// Increment blocks sent
-	ls.CurrentJob.BlocksSent++
-	log.Printf("Job progress: sent block %d/%d for token %s",
-		ls.CurrentJob.BlocksSent, JobLength, ls.CurrentJob.PriceDeviation.Token)
+	// Update all active jobs
+	for _, token := range activeTokens {
+		job := ls.Oracle2Job[token]
+		job.BlocksSent++
+		log.Printf("Job progress for %s: sent block %d/%d", token, job.BlocksSent, JobLength)
 
-	// Mark job as finished after JobLength blocks
-	if ls.CurrentJob.BlocksSent >= JobLength {
-		ls.CurrentJob.Finished = true
-		ls.CurrentJob.EndTime = time.Now()
-		ls.SaveJobToJSON()
+		// Mark job as finished after JobLength blocks
+		if job.BlocksSent >= JobLength {
+			job.Finished = true
+			job.EndTime = time.Now()
+			ls.saveJobToJSON(token, job)
+		}
 	}
 }
 
-// sendSpamTx sends a spam transaction using SendTransferSelf in a goroutine
+// sendSpamTxToActiveJobs sends a spam transaction and adds it to all active jobs
 // nextBaseFee is set to nil
-func (ls *LiquidatorSystem) sendSpamTx(tipCap, feeCap *big.Int, txType string) {
+// Note: This function assumes JobMutex is already held by caller (ProcessJob)
+func (ls *LiquidatorSystem) sendSpamTxToActiveJobs(activeTokens []string, tipCap, feeCap *big.Int, txType string) {
 	eoa, pk, nonce := ls.GetNextEOA()
 	blockNumber := ls.LastBlockNumber
 
+	// Get signed transaction synchronously
+	tx, err := mev.GetTransferSelfTransaction(eoa, nonce, pk, nil, tipCap, feeCap, ls.Client)
+	if err != nil {
+		log.Printf("Error creating %s tx from %s: %v", txType, eoa.Hex(), err)
+		return
+	}
+
+	spamTx := SpamTx{
+		TxHash:          tx.Hash(),
+		From:            eoa,
+		TipCap:          tipCap,
+		FeeCap:          feeCap,
+		Nonce:           nonce,
+		BlockNumberSend: blockNumber,
+		SendTime:        time.Now(),
+		TxType:          txType,
+	}
+
+	// Add the tx to all active jobs (JobMutex is already held by caller)
+	for _, token := range activeTokens {
+		if job, ok := ls.Oracle2Job[token]; ok && job != nil && !job.Finished {
+			job.SpamTxs = append(job.SpamTxs, spamTx)
+		}
+	}
+
+	log.Printf("Created %s tx: hash=%s, from=%s, nonce=%d, tipCap=%s, feeCap=%s (added to %d jobs)",
+		txType, tx.Hash().Hex(), eoa.Hex(), nonce, tipCap.String(), feeCap.String(), len(activeTokens))
+
+	// Send transaction asynchronously
 	go func() {
-		tx, err := mev.SendTransferSelf(eoa, nonce, pk, nil, tipCap, feeCap, ls.Client)
-		if err != nil {
-			log.Printf("Error sending %s tx from %s: %v", txType, eoa.Hex(), err)
+		if err := ls.Client.SendTransaction(context.Background(), tx); err != nil {
+			log.Printf("Error sending %s tx %s: %v", txType, tx.Hash().Hex(), err)
 			return
 		}
-
-		spamTx := SpamTx{
-			TxHash:          tx.Hash(),
-			From:            eoa,
-			TipCap:          tipCap,
-			FeeCap:          feeCap,
-			Nonce:           nonce,
-			BlockNumberSend: blockNumber,
-			SendTime:        time.Now(),
-			TxType:          txType,
-		}
-
-		ls.JobMutex.Lock()
-		if ls.CurrentJob != nil {
-			ls.CurrentJob.SpamTxs = append(ls.CurrentJob.SpamTxs, spamTx)
-		}
-		ls.JobMutex.Unlock()
-
-		log.Printf("Sent %s tx: hash=%s, from=%s, nonce=%d, tipCap=%s, feeCap=%s",
-			txType, tx.Hash().Hex(), eoa.Hex(), nonce, tipCap.String(), feeCap.String())
+		log.Printf("Sent %s tx: hash=%s", txType, tx.Hash().Hex())
 	}()
 }
 
-// SaveJobToJSON saves the finished job to a JSON file
-func (ls *LiquidatorSystem) SaveJobToJSON() {
-	if ls.CurrentJob == nil {
+// saveJobToJSON saves the finished job to a JSON file
+func (ls *LiquidatorSystem) saveJobToJSON(token string, job *Job) {
+	if job == nil {
 		return
 	}
 
 	// Create filename with timestamp
-	now := ls.CurrentJob.StartTime
+	now := job.StartTime
 	date := now.Format("20060102")
 	hourStr := now.Format("15")
-	filename := filepath.Join("data", date, hourStr, now.Format("150405")+"_job.json")
+	// Include token in filename (replace unsafe chars for safe filename)
+	safeToken := token
+	safeToken = filepath.Base(safeToken) // Remove path separators
+	filename := filepath.Join("data", date, hourStr, now.Format("150405")+"_"+safeToken+"_job.json")
 
-	if err := utils.WriteToJson(ls.CurrentJob, filename); err != nil {
-		log.Printf("Error saving job: %v", err)
+	if err := utils.WriteToJson(job, filename); err != nil {
+		log.Printf("Error saving job for %s: %v", token, err)
 		return
 	}
 
 	log.Printf("Job saved to %s (token=%s, blocksSent=%d, txsSent=%d, duration=%v)",
-		filename, ls.CurrentJob.PriceDeviation.Token, ls.CurrentJob.BlocksSent,
-		len(ls.CurrentJob.SpamTxs), ls.CurrentJob.EndTime.Sub(ls.CurrentJob.StartTime))
+		filename, token, job.BlocksSent, len(job.SpamTxs), job.EndTime.Sub(job.StartTime))
 }
 
 // StartFeeDataSaver starts a goroutine that saves AllFeeDataRecords every 10 minutes
@@ -465,7 +478,6 @@ func (ls *LiquidatorSystem) Start() {
 		case pd := <-ls.PriceDeviationChan:
 			log.Printf("Price deviation detected: token=%s, deviation=%v", pd.Token, pd.Deviation)
 			ls.CreateJob(pd, ls.LastBlockNumber)
-			ls.ProcessJob()
 
 		case err := <-ls.ErrorChan:
 			log.Printf("Error: %v", err)
