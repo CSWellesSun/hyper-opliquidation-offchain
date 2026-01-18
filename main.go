@@ -7,6 +7,8 @@ import (
 	"os"
 	"strconv"
 
+	"hyper-opliquidation-offchain/liquidator"
+
 	"github.com/CSWellesSun/hypermevlib/mev"
 	"github.com/CSWellesSun/hypermevlib/utils"
 	"github.com/ethereum/go-ethereum/common"
@@ -18,6 +20,8 @@ func init() {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 }
 
 func main() {
@@ -26,6 +30,31 @@ func main() {
 	}
 
 	switch os.Args[1] {
+	case "liquidate":
+		// go run main.go liquidate
+		client, err := mev.NewClient(os.Getenv("HYPE_RPC_URL"))
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		mnemonic := os.Getenv("MNEMONIC")
+		if mnemonic == "" {
+			log.Fatal("MNEMONIC environment variable is not set")
+		}
+
+		// Subscribe tokens for price monitoring
+		subscribeTokens := []string{
+			"BTC / USD",
+			"ETH / USD",
+			"HYPE / USD",
+		}
+
+		ls, err := liquidator.NewLiquidatorSystem(client, subscribeTokens, mnemonic)
+		if err != nil {
+			log.Fatalf("Error creating liquidator system: %v", err)
+		}
+		ls.Start()
+
 	case "split":
 		// go run main.go split <splitAddressAmount> <targetAmount> <sendValue>
 		client, err := mev.NewClient(os.Getenv("HYPE_RPC_URL"))
