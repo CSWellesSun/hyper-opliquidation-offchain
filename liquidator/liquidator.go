@@ -34,6 +34,13 @@ type Job struct {
 	Finished       bool                `json:"finished"`
 }
 
+// LastBlockInfo holds the last block number and base fee with a lock
+type LastBlockInfo struct {
+	BlockNumber uint64
+	BaseFee     *big.Int
+	sync.RWMutex
+}
+
 // LiquidatorSystem is the main liquidator system
 type LiquidatorSystem struct {
 	Client             *ethclient.Client
@@ -46,8 +53,7 @@ type LiquidatorSystem struct {
 	ErrorChan          chan error
 	Oracle2Job         map[string]*Job // key is TokenName
 	SubscribeTokens    []string
-	LastBlockNumber    uint64
-	LastBaseFee        *big.Int
+	LastBlock          *LastBlockInfo
 
 	// EOA management
 	SpamEOAs        []common.Address
@@ -85,6 +91,7 @@ func NewLiquidatorSystem(client *ethclient.Client, subscribeTokens []string, mne
 		ErrorChan:          make(chan error, 100),
 		Oracle2Job:         make(map[string]*Job),
 		SubscribeTokens:    subscribeTokens,
+		LastBlock:          &LastBlockInfo{},
 		SpamEOAs:           eoas,
 		SpamPrivateKeys:    privateKeys,
 		SpamNonces:         make(map[common.Address]uint64),
@@ -120,41 +127,55 @@ func (ls *LiquidatorSystem) GetNextEOA() (common.Address, *ecdsa.PrivateKey, uin
 	return eoa, pk, nonce
 }
 
-// UpdateFeeData fetches and updates fee data records
-func (ls *LiquidatorSystem) UpdateFeeData() {
-	ls.FeeDataMutex.Lock()
-	defer ls.FeeDataMutex.Unlock()
-
+// FetchFeeDataAndProcess fetches fee data concurrently and calls ProcessJob immediately
+func (ls *LiquidatorSystem) FetchFeeDataAndProcess() {
 	record := FeeDataRecord{
 		Timestamp: time.Now(),
 	}
 
-	// Get fee history
-	feeHistory, err := GetPendingFeeHistory(ls.Client)
-	if err != nil {
-		record.FeeHistoryError = err.Error()
-	} else {
-		record.FeeHistory = feeHistory
-	}
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-	// Get max priority fee
-	maxPriorityFee, err := GetMaxPriorityFee(ls.Client)
-	if err != nil {
-		record.MaxPriorityError = err.Error()
-	} else {
-		record.MaxPriorityFee = maxPriorityFee
-	}
+	// Fetch fee history concurrently
+	go func() {
+		defer wg.Done()
+		feeHistory, err := GetPendingFeeHistory(ls.Client)
+		if err != nil {
+			record.FeeHistoryError = err.Error()
+		} else {
+			record.FeeHistory = feeHistory
+		}
+	}()
 
+	// Fetch max priority fee concurrently
+	go func() {
+		defer wg.Done()
+		maxPriorityFee, err := GetMaxPriorityFee(ls.Client)
+		if err != nil {
+			record.MaxPriorityError = err.Error()
+		} else {
+			record.MaxPriorityFee = maxPriorityFee
+		}
+	}()
+
+	// Wait for both to complete
+	wg.Wait()
+
+	// Update fee data records
+	ls.FeeDataMutex.Lock()
 	// Maintain max 4 recent records
 	if len(ls.FeeDataRecords) >= MaxFeeDataRecords {
 		ls.FeeDataRecords = ls.FeeDataRecords[1:]
 	}
 	ls.FeeDataRecords = append(ls.FeeDataRecords, record)
-
 	// Also append to all records for saving
 	ls.AllFeeDataRecords = append(ls.AllFeeDataRecords, record)
+	ls.FeeDataMutex.Unlock()
 
-	log.Printf("Fee data updated: records=%d, allRecords=%d, maxPriorityFee=%v", len(ls.FeeDataRecords), len(ls.AllFeeDataRecords), maxPriorityFee)
+	log.Printf("Fee data updated: records=%d, allRecords=%d, maxPriorityFee=%v, maxReward=%v", len(ls.FeeDataRecords), len(ls.AllFeeDataRecords), record.MaxPriorityFee, GetMaxReward(record.FeeHistory.Reward))
+
+	// Immediately process job after getting fee data
+	ls.ProcessJob()
 }
 
 // FetchBlockAndLogs fetches the latest block and checks for Redstone logs
@@ -166,10 +187,13 @@ func (ls *LiquidatorSystem) FetchBlockAndLogs() (*types.Block, []types.Log, erro
 	}
 
 	// Skip if same block
-	if blockNumber == ls.LastBlockNumber {
+	ls.LastBlock.RLock()
+	lastBlockNumber := ls.LastBlock.BlockNumber
+	ls.LastBlock.RUnlock()
+
+	if blockNumber == lastBlockNumber {
 		return nil, nil, nil
 	}
-	ls.LastBlockNumber = blockNumber
 
 	// Get block
 	block, err := ls.Client.BlockByNumber(context.Background(), new(big.Int).SetUint64(blockNumber))
@@ -177,11 +201,14 @@ func (ls *LiquidatorSystem) FetchBlockAndLogs() (*types.Block, []types.Log, erro
 		return nil, nil, err
 	}
 
-	// Update LastBaseFee from block
+	// Update LastBlock with lock
+	ls.LastBlock.Lock()
+	ls.LastBlock.BlockNumber = blockNumber
 	if block.BaseFee() != nil {
-		ls.LastBaseFee = block.BaseFee()
-		log.Printf("Block %d baseFee: %s", blockNumber, ls.LastBaseFee.String())
+		ls.LastBlock.BaseFee = block.BaseFee()
+		log.Printf("Block %d baseFee: %s", blockNumber, ls.LastBlock.BaseFee.String())
 	}
+	ls.LastBlock.Unlock()
 
 	// Query logs for REDSTONE_VALUEUPDATE_EVENT_TOPIC
 	query := ethereum.FilterQuery{
@@ -244,19 +271,24 @@ func (ls *LiquidatorSystem) ProcessJob() {
 		return
 	}
 
-	if ls.LastBaseFee == nil {
+	// Get LastBlock info with lock
+	ls.LastBlock.RLock()
+	baseFee := ls.LastBlock.BaseFee
+	lastBlockNumber := ls.LastBlock.BlockNumber
+	ls.LastBlock.RUnlock()
+
+	if baseFee == nil {
 		log.Printf("No baseFee available, skipping")
 		return
 	}
 
 	// feeCap = baseFee * 2 + tipCap
-	baseFee := ls.LastBaseFee
 	baseFeeDouble := new(big.Int).Mul(baseFee, big.NewInt(2))
 
 	// Send len(FeeDataRecords)*2 transactions once (maxReward and maxPriority for each record)
 	txCount := len(feeDataRecords) * 2
 	log.Printf("Sending %d transactions at block %d for %d active jobs (feeDataRecords=%d, baseFee=%s)",
-		txCount, ls.LastBlockNumber, len(activeTokens), len(feeDataRecords), baseFee.String())
+		txCount, lastBlockNumber, len(activeTokens), len(feeDataRecords), baseFee.String())
 
 	for i, record := range feeDataRecords {
 		if record.FeeHistory == nil || record.MaxPriorityFee == nil {
@@ -272,7 +304,7 @@ func (ls *LiquidatorSystem) ProcessJob() {
 			// feeCap = baseFee * 2 + tipCap
 			maxRewardFeeCap := new(big.Int).Add(baseFeeDouble, maxRewardTip)
 			// Send maxReward tx and add to all active jobs
-			ls.sendSpamTxToActiveJobs(activeTokens, maxRewardTip, maxRewardFeeCap, "maxReward")
+			ls.sendSpamTxToActiveJobs(activeTokens, maxRewardTip, maxRewardFeeCap, "maxReward", lastBlockNumber)
 		} else {
 			log.Printf("Skipping maxReward tx: tipCap is 0")
 		}
@@ -285,7 +317,7 @@ func (ls *LiquidatorSystem) ProcessJob() {
 			// feeCap = baseFee * 2 + tipCap
 			maxPriorityFeeCap := new(big.Int).Add(baseFeeDouble, maxPriorityTip)
 			// Send maxPriority tx and add to all active jobs
-			ls.sendSpamTxToActiveJobs(activeTokens, maxPriorityTip, maxPriorityFeeCap, "maxPriority")
+			ls.sendSpamTxToActiveJobs(activeTokens, maxPriorityTip, maxPriorityFeeCap, "maxPriority", lastBlockNumber)
 		} else {
 			log.Printf("Skipping maxPriority tx: tipCap is 0")
 		}
@@ -309,9 +341,8 @@ func (ls *LiquidatorSystem) ProcessJob() {
 // sendSpamTxToActiveJobs sends a spam transaction and adds it to all active jobs
 // nextBaseFee is set to nil
 // Note: This function assumes JobMutex is already held by caller (ProcessJob)
-func (ls *LiquidatorSystem) sendSpamTxToActiveJobs(activeTokens []string, tipCap, feeCap *big.Int, txType string) {
+func (ls *LiquidatorSystem) sendSpamTxToActiveJobs(activeTokens []string, tipCap, feeCap *big.Int, txType string, blockNumber uint64) {
 	eoa, pk, nonce := ls.GetNextEOA()
-	blockNumber := ls.LastBlockNumber
 
 	// Get signed transaction synchronously
 	tx, err := mev.GetTransferSelfTransaction(eoa, nonce, pk, nil, tipCap, feeCap, ls.Client)
@@ -416,6 +447,46 @@ func (ls *LiquidatorSystem) SaveFeeDataToJSON() {
 	log.Printf("Fee data saved to %s (records=%d)", filename, len(records))
 }
 
+// StartBlockFetcher starts a goroutine that fetches blocks and logs independently at 0ms
+func (ls *LiquidatorSystem) StartBlockFetcher() {
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			// Wait for next second boundary (0ms)
+			now := time.Now()
+			sleepDuration := time.Duration(1000-now.Nanosecond()/1000000) * time.Millisecond
+			if sleepDuration > 0 && sleepDuration < time.Second {
+				time.Sleep(sleepDuration)
+			}
+
+			go func() {
+				// Fetch block and logs
+				block, logs, err := ls.FetchBlockAndLogs()
+				if err != nil {
+					log.Printf("Error fetching block: %v", err)
+					return
+				}
+
+				if block != nil {
+					log.Printf("Block %d fetched, logs count: %d", block.NumberU64(), len(logs))
+				}
+
+				// Send logs to logChan for StartPriceFeed to process
+				for _, logEntry := range logs {
+					select {
+					case ls.LogChan <- logEntry:
+						log.Printf("Log sent to channel: tx=%s", logEntry.TxHash.Hex())
+					default:
+						log.Printf("LogChan full, dropping log")
+					}
+				}
+			}()
+		}
+	}()
+}
+
 // Start starts the liquidator system
 func (ls *LiquidatorSystem) Start() {
 	log.Printf("Starting liquidator system with tokens: %v", ls.SubscribeTokens)
@@ -427,6 +498,9 @@ func (ls *LiquidatorSystem) Start() {
 
 	// Start fee data saver (saves every 10 minutes)
 	ls.StartFeeDataSaver()
+
+	// Start block fetcher (independent goroutine)
+	ls.StartBlockFetcher()
 
 	// Start price feed monitoring
 	mev.StartPriceFeed(ls.Client, ls.SubscribeTokens, ls.LogChan, ls.PriceFeedChan, ls.ErrorChan)
@@ -448,36 +522,15 @@ func (ls *LiquidatorSystem) Start() {
 
 			log.Printf("=== Tick at %s ===", time.Now().Format("15:04:05.000"))
 
-			// Step 1: Update fee data
-			ls.UpdateFeeData()
-
-			// Step 2: Fetch block and logs
-			block, logs, err := ls.FetchBlockAndLogs()
-			if err != nil {
-				log.Printf("Error fetching block: %v", err)
-				continue
-			}
-
-			if block != nil {
-				log.Printf("Block %d fetched, logs count: %d", block.NumberU64(), len(logs))
-			}
-
-			// Step 3: Send logs to logChan for StartPriceFeed to process
-			for _, logEntry := range logs {
-				select {
-				case ls.LogChan <- logEntry:
-					log.Printf("Log sent to channel: tx=%s", logEntry.TxHash.Hex())
-				default:
-					log.Printf("LogChan full, dropping log")
-				}
-			}
-
-			// Step 4: Process any existing job
-			ls.ProcessJob()
+			// At 0ms: Fetch fee data concurrently and immediately process job
+			ls.FetchFeeDataAndProcess()
 
 		case pd := <-ls.PriceDeviationChan:
 			log.Printf("Price deviation detected: token=%s, deviation=%v", pd.Token, pd.Deviation)
-			ls.CreateJob(pd, ls.LastBlockNumber)
+			ls.LastBlock.RLock()
+			blockNum := ls.LastBlock.BlockNumber
+			ls.LastBlock.RUnlock()
+			ls.CreateJob(pd, blockNum)
 
 		case err := <-ls.ErrorChan:
 			log.Printf("Error: %v", err)
