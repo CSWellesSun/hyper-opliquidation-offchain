@@ -20,7 +20,6 @@ import (
 const (
 	MaxFeeDataRecords = 4
 	JobLength         = 10
-	NumEOAs           = 8
 )
 
 // Job represents a liquidation job
@@ -63,20 +62,20 @@ type LiquidatorSystem struct {
 }
 
 // NewLiquidatorSystem creates a new liquidator system
-func NewLiquidatorSystem(client *ethclient.Client, subscribeTokens []string, mnemonic string) (*LiquidatorSystem, error) {
+func NewLiquidatorSystem(client *ethclient.Client, subscribeTokens []string, mnemonic string, numEOAs int) (*LiquidatorSystem, error) {
 	// Get private keys from mnemonic
-	privateKeys, err := utils.GetPrivateKeysFromMnemonic(mnemonic, NumEOAs)
+	privateKeys, err := utils.GetPrivateKeysFromMnemonic(mnemonic, numEOAs)
 	if err != nil {
 		return nil, err
 	}
 
 	// Get addresses from private keys
-	eoas := make([]common.Address, NumEOAs)
+	eoas := make([]common.Address, numEOAs)
 	for i, pk := range privateKeys {
 		eoas[i] = utils.GetAddress(pk)
 	}
 
-	log.Printf("Initialized %d EOAs for spam transactions", NumEOAs)
+	log.Printf("Initialized %d EOAs for spam transactions", numEOAs)
 	for i, eoa := range eoas {
 		log.Printf("EOA %d: %s", i, eoa.Hex())
 	}
@@ -122,7 +121,7 @@ func (ls *LiquidatorSystem) GetNextEOA() (common.Address, *ecdsa.PrivateKey, uin
 	ls.SpamNonces[eoa] = nonce + 1
 
 	// Move to next EOA
-	ls.CurEOAIndex = (ls.CurEOAIndex + 1) % NumEOAs
+	ls.CurEOAIndex = (ls.CurEOAIndex + 1) % len(ls.SpamEOAs)
 
 	return eoa, pk, nonce
 }

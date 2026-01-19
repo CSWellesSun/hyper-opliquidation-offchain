@@ -47,9 +47,23 @@ func main() {
 			"BTC / USD",
 			"ETH / USD",
 			"HYPE / USD",
+			"UBTC / USD",
+			"kHYPE / USD",
+			"stHYPE / USD",
+			"XAUt / USD",
 		}
 
-		ls, err := liquidator.NewLiquidatorSystem(client, subscribeTokens, mnemonic)
+		numEOAs, err := strconv.Atoi(os.Getenv("NUM_EOAS"))
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		ls, err := liquidator.NewLiquidatorSystem(
+			client,
+			subscribeTokens,
+			mnemonic,
+			numEOAs,
+		)
 		if err != nil {
 			log.Fatalf("Error creating liquidator system: %v", err)
 		}
@@ -90,8 +104,8 @@ func main() {
 		if err != nil {
 			log.Fatal("Error getting pending nonce")
 		}
-		for i := 0; i < len(splitAddresses); i += 50 {
-			end := i + 50
+		for i := 0; i < len(splitAddresses); i += 20 {
+			end := i + 20
 			if end > len(splitAddresses) {
 				end = len(splitAddresses)
 			}
