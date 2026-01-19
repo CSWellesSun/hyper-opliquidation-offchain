@@ -57,7 +57,8 @@ type LiquidatorSystem struct {
 	// EOA management
 	SpamEOAs        []common.Address
 	SpamPrivateKeys []*ecdsa.PrivateKey
-	SpamNonces      map[common.Address]uint64
+	SpamNonces      map[common.Address]*EOANonceInfo
+	NoncesMutex     sync.Mutex
 	CurEOAIndex     int
 }
 
@@ -93,37 +94,118 @@ func NewLiquidatorSystem(client *ethclient.Client, subscribeTokens []string, mne
 		LastBlock:          &LastBlockInfo{},
 		SpamEOAs:           eoas,
 		SpamPrivateKeys:    privateKeys,
-		SpamNonces:         make(map[common.Address]uint64),
+		SpamNonces:         make(map[common.Address]*EOANonceInfo),
 		CurEOAIndex:        0,
 	}, nil
 }
 
 // InitializeNonces initializes nonces for all EOAs
 func (ls *LiquidatorSystem) InitializeNonces() error {
+	// Get current block number
+	blockNumber, err := ls.Client.BlockNumber(context.Background())
+	if err != nil {
+		return err
+	}
+
+	ls.NoncesMutex.Lock()
+	defer ls.NoncesMutex.Unlock()
+
 	for _, eoa := range ls.SpamEOAs {
 		nonce, err := ls.Client.PendingNonceAt(context.Background(), eoa)
 		if err != nil {
 			return err
 		}
-		ls.SpamNonces[eoa] = nonce
-		log.Printf("Initialized nonce for %s: %d", eoa.Hex(), nonce)
+		ls.SpamNonces[eoa] = &EOANonceInfo{
+			RealNonce:      nonce,
+			RealNonceBlock: blockNumber,
+			SendNonce:      nonce,
+			SendNonceBlock: blockNumber,
+		}
+		log.Printf("Initialized nonce for %s: nonce=%d, block=%d", eoa.Hex(), nonce, blockNumber)
 	}
 	return nil
 }
 
 // GetNextEOA returns the next EOA in round-robin fashion
 func (ls *LiquidatorSystem) GetNextEOA() (common.Address, *ecdsa.PrivateKey, uint64) {
+	ls.NoncesMutex.Lock()
+	defer ls.NoncesMutex.Unlock()
+
 	eoa := ls.SpamEOAs[ls.CurEOAIndex]
 	pk := ls.SpamPrivateKeys[ls.CurEOAIndex]
-	nonce := ls.SpamNonces[eoa]
+	nonceInfo := ls.SpamNonces[eoa]
 
-	// Increment nonce for next use
-	ls.SpamNonces[eoa] = nonce + 1
+	// Check if SendNonceBlock is 10+ blocks behind RealNonceBlock
+	if nonceInfo.RealNonceBlock >= nonceInfo.SendNonceBlock+10 {
+		log.Printf("Syncing nonce for %s: SendNonce %d->%d, SendNonceBlock %d->%d (RealNonceBlock=%d)",
+			eoa.Hex(), nonceInfo.SendNonce, nonceInfo.RealNonce,
+			nonceInfo.SendNonceBlock, nonceInfo.RealNonceBlock, nonceInfo.RealNonceBlock)
+		nonceInfo.SendNonce = nonceInfo.RealNonce
+		nonceInfo.SendNonceBlock = nonceInfo.RealNonceBlock
+	}
+
+	// Get current nonce to send
+	nonce := nonceInfo.SendNonce
+
+	// Increment SendNonce for next use
+	nonceInfo.SendNonce++
+
+	// Update SendNonceBlock to current block
+	ls.LastBlock.RLock()
+	currentBlock := ls.LastBlock.BlockNumber
+	ls.LastBlock.RUnlock()
+	nonceInfo.SendNonceBlock = currentBlock
 
 	// Move to next EOA
 	ls.CurEOAIndex = (ls.CurEOAIndex + 1) % len(ls.SpamEOAs)
 
 	return eoa, pk, nonce
+}
+
+// updateRealNonces updates real nonces for all EOAs from block transactions
+func (ls *LiquidatorSystem) updateRealNonces(block *types.Block) {
+	ls.NoncesMutex.Lock()
+	defer ls.NoncesMutex.Unlock()
+
+	blockNumber := block.NumberU64()
+
+	// Track the highest nonce seen for each EOA in this block
+	eoaNonceMap := make(map[common.Address]uint64)
+
+	// Iterate through all transactions in the block
+	for _, tx := range block.Transactions() {
+		sender, err := mev.Sender(tx)
+		if err != nil {
+			continue
+		}
+
+		// Check if this transaction is from one of our EOAs
+		_, exists := ls.SpamNonces[sender]
+		if !exists {
+			continue
+		}
+
+		txNonce := tx.Nonce()
+		// Track the highest nonce for this EOA
+		if prevNonce, ok := eoaNonceMap[sender]; !ok || txNonce > prevNonce {
+			eoaNonceMap[sender] = txNonce
+		}
+	}
+
+	// Update RealNonce to the next nonce after the highest one seen in this block
+	for eoa, highestNonce := range eoaNonceMap {
+		nonceInfo := ls.SpamNonces[eoa]
+		nextNonce := highestNonce + 1
+		if nonceInfo.RealNonce != nextNonce {
+			log.Printf("Real nonce updated for %s: %d->%d at block %d (tx nonce: %d)",
+				eoa.Hex(), nonceInfo.RealNonce, nextNonce, blockNumber, highestNonce)
+		}
+		nonceInfo.RealNonce = nextNonce
+	}
+	for eoa := range ls.SpamNonces {
+		nonceInfo := ls.SpamNonces[eoa]
+		nonceInfo.RealNonceBlock = blockNumber
+	}
 }
 
 // FetchFeeDataAndProcess fetches fee data concurrently and calls ProcessJob immediately
@@ -208,6 +290,9 @@ func (ls *LiquidatorSystem) FetchBlockAndLogs() (*types.Block, []types.Log, erro
 		log.Printf("Block %d baseFee: %s", blockNumber, ls.LastBlock.BaseFee.String())
 	}
 	ls.LastBlock.Unlock()
+
+	// Update real nonces for all EOAs from block transactions
+	ls.updateRealNonces(block)
 
 	// Query logs for REDSTONE_VALUEUPDATE_EVENT_TOPIC
 	query := ethereum.FilterQuery{

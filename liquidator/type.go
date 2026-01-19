@@ -28,3 +28,11 @@ type SpamTx struct {
 	SendTime        time.Time      `json:"sendTime"`
 	TxType          string         `json:"txType"` // "maxReward" or "maxPriority"
 }
+
+// EOANonceInfo stores nonce information for an EOA
+type EOANonceInfo struct {
+	RealNonce      uint64 // Real nonce queried from chain
+	RealNonceBlock uint64 // Block number when real nonce was last updated
+	SendNonce      uint64 // Nonce used for sending transactions
+	SendNonceBlock uint64 // Block number when send nonce was last updated
+}
