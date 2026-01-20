@@ -63,6 +63,8 @@ func main() {
 			subscribeTokens,
 			mnemonic,
 			numEOAs,
+			os.Getenv("TELEGRAM_BOT_TOKEN"),
+			os.Getenv("TELEGRAM_CHAT_ID_FOR_INFO"),
 		)
 		if err != nil {
 			log.Fatalf("Error creating liquidator system: %v", err)

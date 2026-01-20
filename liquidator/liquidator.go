@@ -3,9 +3,11 @@ package liquidator
 import (
 	"context"
 	"crypto/ecdsa"
+	"fmt"
 	"log"
 	"math/big"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -54,6 +56,9 @@ type LiquidatorSystem struct {
 	SubscribeTokens    []string
 	LastBlock          *LastBlockInfo
 
+	TgBotToken      string
+	TgChatIdForInfo string
+
 	// EOA management
 	SpamEOAs        []common.Address
 	SpamPrivateKeys []*ecdsa.PrivateKey
@@ -63,7 +68,10 @@ type LiquidatorSystem struct {
 }
 
 // NewLiquidatorSystem creates a new liquidator system
-func NewLiquidatorSystem(client *ethclient.Client, subscribeTokens []string, mnemonic string, numEOAs int) (*LiquidatorSystem, error) {
+func NewLiquidatorSystem(
+	client *ethclient.Client, subscribeTokens []string, mnemonic string, numEOAs int,
+	tgBotToken string, tgChatIdForInfo string,
+) (*LiquidatorSystem, error) {
 	// Get private keys from mnemonic
 	privateKeys, err := utils.GetPrivateKeysFromMnemonic(mnemonic, numEOAs)
 	if err != nil {
@@ -96,6 +104,8 @@ func NewLiquidatorSystem(client *ethclient.Client, subscribeTokens []string, mne
 		SpamPrivateKeys:    privateKeys,
 		SpamNonces:         make(map[common.Address]*EOANonceInfo),
 		CurEOAIndex:        0,
+		TgBotToken:         tgBotToken,
+		TgChatIdForInfo:    tgChatIdForInfo,
 	}, nil
 }
 
@@ -478,6 +488,7 @@ func (ls *LiquidatorSystem) saveJobToJSON(token string, job *Job) {
 	hourStr := now.Format("15")
 	// Include token in filename (replace unsafe chars for safe filename)
 	safeToken := token
+	safeToken = strings.ReplaceAll(safeToken, " / ", "_")
 	safeToken = filepath.Base(safeToken) // Remove path separators
 	filename := filepath.Join("data", date, hourStr, now.Format("150405")+"_"+safeToken+"_job.json")
 
@@ -586,8 +597,10 @@ func (ls *LiquidatorSystem) Start() {
 	// Start block fetcher (independent goroutine)
 	ls.StartBlockFetcher()
 
+	priceFeedChan := make(chan *mev.PriceFeed, 100)
+
 	// Start price feed monitoring
-	mev.StartPriceFeed(ls.Client, ls.SubscribeTokens, ls.LogChan, ls.PriceFeedChan, ls.ErrorChan)
+	mev.StartPriceFeed(ls.Client, ls.SubscribeTokens, ls.LogChan, priceFeedChan, ls.ErrorChan)
 	mev.StartPythPriceFeedForDeviation(ls.Client, ls.SubscribeTokens, ls.PriceFeedChan, ls.PriceDeviationChan, ls.ErrorChan, nil)
 
 	// Main loop - runs every second at 0ms
@@ -615,6 +628,23 @@ func (ls *LiquidatorSystem) Start() {
 			blockNum := ls.LastBlock.BlockNumber
 			ls.LastBlock.RUnlock()
 			ls.CreateJob(pd, blockNum)
+
+		case priceFeed := <-priceFeedChan:
+			hasActiveJob := false
+			for _, job := range ls.Oracle2Job {
+				if !job.Finished {
+					hasActiveJob = true
+					break
+				}
+			}
+			if !hasActiveJob {
+				log.Printf("[HYPE-LIQUIDATOR] No active job found for price feed: token=%s", priceFeed.Token)
+				ls.NotifyInfo(fmt.Sprintf("[HYPE-LIQUIDATOR] No active job found for price feed: token=%s", priceFeed.Token))
+			} else {
+				log.Printf("[HYPE-LIQUIDATOR] Active job found for price feed: token=%s", priceFeed.Token)
+				ls.NotifyInfo(fmt.Sprintf("[HYPE-LIQUIDATOR] Active job found for price feed: token=%s", priceFeed.Token))
+			}
+			ls.PriceFeedChan <- priceFeed
 
 		case err := <-ls.ErrorChan:
 			log.Printf("Error: %v", err)
