@@ -71,6 +71,13 @@ func main() {
 		}
 		ls.Start()
 
+	case "analysis":
+		// go run main.go analysis
+		client, err := mev.NewClient(os.Getenv("HYPE_RPC_URL"))
+		if err != nil {
+			log.Fatal(err)
+		}
+		liquidator.AnalyseRecall(client)
 	case "split":
 		// go run main.go split <splitAddressAmount> <targetAmount> <sendValue>
 		client, err := mev.NewClient(os.Getenv("HYPE_RPC_URL"))
